@@ -1,0 +1,163 @@
+# 0) Load required packages
+library(quantmod)
+library(PerformanceAnalytics)
+library(zoo)
+library(purrr)
+library(tibble)
+library(ggplot2)
+library(scales)
+library(dplyr) 
+
+# 1) List of tickers (only those successfully retrieved are included)
+success <- c("XOM","CVX","COP","EOG","SLB","LIN","APD","DD","SHW","ECL",
+             "HON","GE","BA","CAT","MMM","AMZN","HD","DIS","MCD","SBUX",
+             "PG","KO","PEP","WMT","MO","JNJ","UNH","PFE","MRK","ABT",
+             "JPM","BAC","WFC","C","GS","AAPL","MSFT","NVDA","INTC","CSCO",
+             "VZ","T","NFLX","CMCSA","DUK","NEE","SO","AEP","EXC",
+             "PLD","EQIX","SPG","PSA","O")
+
+# 2) Specify time period for data retrieval
+start_date <- "2018-01-01"
+end_date   <- "2022-12-31"
+
+# 3) Function to fetch and clean adjusted closing prices
+get_clean_prices <- function(sym) {
+  dat <- tryCatch(
+    getSymbols(sym,
+               src       = "yahoo",
+               from      = start_date,
+               to        = end_date,
+               auto.assign = FALSE),
+    error = function(e) NULL
+  )
+  if (is.null(dat)) return(NULL)
+  p <- Ad(dat)
+  p <- na.locf(p, na.rm = FALSE)        # forward fill
+  p <- na.locf(p, fromLast = TRUE)      # backward fill
+  return(p)
+}
+
+# 4) Retrieve prices for all tickers and discard failures
+price_list <- success %>%
+  set_names() %>%
+  map(get_clean_prices) %>%
+  compact()
+
+# 5) Merge all prices into a single xts object (keeping only common dates)
+prices_all <- reduce(
+  price_list,
+  function(x, y) merge(x, y, join = "inner")
+)
+
+# 6) Compute daily log returns
+rets_all <- diff(log(prices_all))
+rets_all <- na.omit(rets_all)
+
+# 7) Define function to compute rolling Z-scores for a given window
+rolling_zscore <- function(returns_xts, window = 60, step = 5) {
+  dates <- index(returns_xts)
+  N     <- nrow(returns_xts)
+  result <- list()
+  for (start in seq(1, N - window + 1, by = step)) {
+    end      <- start + window - 1
+    win_xt   <- returns_xts[start:end, ]
+    win_clean<- na.omit(win_xt)
+    if (nrow(win_clean) < window * 0.8) next  # skip if too much missing data
+    zmat     <- scale(win_clean)
+    result[[length(result) + 1]] <- list(
+      start_date = dates[start],
+      end_date   = dates[end],
+      data       = zmat
+    )
+  }
+  return(result)
+}
+
+# 8) Compute rolling Z-scores over the full period
+z_list <- rolling_zscore(rets_all, window = 60, step = 5)
+
+# 9) Perform PCA and compute Absorption Ratio (AR) for each window
+k <- 5
+pca_list <- map(z_list, function(z) {
+  pca <- prcomp(z$data, center = FALSE, scale. = FALSE)
+  tibble(
+    Date = z$end_date,
+    AR   = sum((pca$sdev[1:k]^2) / sum(pca$sdev^2))
+  )
+})
+
+# 10) Combine all AR values into one data frame
+absorp_ratio <- bind_rows(pca_list)
+
+# 11) Plot the Absorption Ratio with ±2 standard deviation bands
+p <- ggplot(absorp_ratio, aes(x = Date, y = AR)) +
+  geom_line(linewidth = 1, color = "darkgreen") +
+  geom_hline(yintercept = mean(absorp_ratio$AR),
+             linetype    = "dashed", color = "blue") +
+  geom_hline(yintercept = mean(absorp_ratio$AR) + 2*sd(absorp_ratio$AR),
+             linetype    = "dashed", color = "red") +
+  geom_hline(yintercept = mean(absorp_ratio$AR) - 2*sd(absorp_ratio$AR),
+             linetype    = "dashed", color = "red") +
+  scale_x_date(breaks = date_breaks("6 months"),
+               labels = date_format("%Y-%m")) +
+  labs(
+    title = "Absorption Ratio (Top 5 Principal Components)",
+    x     = "Date",
+    y     = "Absorption Ratio"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(p)
+
+# -- Extended analysis for multiple window sizes --
+library(dplyr)
+library(purrr)
+
+# Compute ARs for multiple rolling window sizes
+windows <- c(30, 60, 90)
+make_AR <- function(win) {
+  zlist <- rolling_zscore(rets_all, window = win, step = 5)
+  tibble(
+    Date = map(zlist, "end_date") %>% unlist(),
+    AR   = map_dbl(zlist, function(z) {
+      pcs <- prcomp(z$data, center = FALSE, scale. = FALSE)$sdev
+      sum(pcs[1:5]^2) / sum(pcs^2)
+    }),
+    Win  = factor(win)
+  )
+}
+ar_multi <- map_df(windows, make_AR)
+
+# Ensure Date column is of Date class
+ar_multi <- ar_multi %>%
+  mutate(Date = as.Date(Date))
+
+# Compute mean and ±2σ for each window
+stats <- ar_multi %>%
+  group_by(Win) %>%
+  summarize(
+    m     = mean(AR),
+    upper = m + 2*sd(AR),
+    lower = m - 2*sd(AR),
+    .groups = "drop"
+  )
+
+# Plot AR across different window sizes
+ggplot(ar_multi, aes(x = Date, y = AR, colour = Win)) +
+  geom_line(linewidth = 1) +
+  geom_hline(data = stats, aes(yintercept = m, colour = Win), linetype = "dashed") +
+  geom_hline(data = stats, aes(yintercept = upper, colour = Win), linetype = "dotted") +
+  geom_hline(data = stats, aes(yintercept = lower, colour = Win), linetype = "dotted") +
+  scale_colour_brewer(palette = "Set1", name = "Window\n(days)") +
+  scale_x_date(breaks = date_breaks("6 months"), labels = date_format("%Y-%m")) +
+  labs(
+    title = "Absorption Ratio — Sensitivity to Rolling Window Length",
+    x     = "Date",
+    y     = "Absorption Ratio"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x     = element_text(angle = 45, hjust = 1),
+    legend.position = "bottom"
+  )
