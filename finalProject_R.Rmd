@@ -1,0 +1,126 @@
+---
+title: "Yuta_Rcode"
+author: "Junhan Li"
+date: "2025-05-15"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Library Need
+```{r pressure, echo=TRUE}
+library(quantmod)
+library(PerformanceAnalytics)
+library(zoo)
+library(purrr)
+library(tibble)
+library(ggplot2)
+library(scales)
+library(dplyr)
+```
+
+
+
+## Retrieve prices of all tickers
+```{r pressure, echo=TRUE}
+# Function:
+#   - Fetch and Clean adjusted closing prices
+get_clean_prices <- function(sym) {
+  dat <- tryCatch(
+    getSymbols(sym,
+               src  = "yahoo",
+               from = start_date,
+               to = end_date,
+               auto.assign = FALSE),
+    error = function(e) NULL
+  )
+  if (is.null(dat)) return(NULL)
+  p <- Ad(dat)
+  p <- na.locf(p, na.rm = FALSE)        # forward fill
+  p <- na.locf(p, fromLast = TRUE)      # backward fill
+  return(p)
+}
+
+
+success <- c("XOM","CVX","COP","EOG","SLB","LIN","APD","DD","SHW","ECL",
+             "HON","GE","BA","CAT","MMM","AMZN","HD","DIS","MCD","SBUX",
+             "PG","KO","PEP","WMT","MO","JNJ","UNH","PFE","MRK","ABT",
+             "JPM","BAC","WFC","C","GS","AAPL","MSFT","NVDA","INTC","CSCO",
+             "VZ","T","NFLX","CMCSA","DUK","NEE","SO","AEP","EXC",
+             "PLD","EQIX","SPG","PSA","O")
+
+# Time interval for data retrieval
+start_date <- "2018-01-01"
+end_date   <- "2022-12-31"
+  
+price_list <- success %>%
+  set_names() %>%
+  map(get_clean_prices) %>%
+  compact()
+
+```
+
+
+## Merge prices and compute daily log returns
+```{r pressure, echo=TRUE}
+
+# Merge all prices into a single xts object (keeping common dates)
+prices_all <- reduce(
+  price_list,
+  function(x, y) merge(x, y, join = "inner")
+)
+
+# daily log returns
+rets_all <- diff(log(prices_all))
+rets_all <- na.omit(rets_all)
+
+rets_all
+```
+
+
+
+## Compute rolling Z-scores
+```{r pressure, echo=TRUE}
+# Function:
+# - Compute rolling Z-scores for a given window
+rolling_zscore <- function(returns_xts, window = 60, step = 5) {
+  dates <- index(returns_xts)
+  N     <- nrow(returns_xts)
+  result <- list()
+  for (start in seq(1, N - window + 1, by = step)) {
+    end      <- start + window - 1
+    win_xt   <- returns_xts[start:end, ]
+    win_clean<- na.omit(win_xt)
+    if (nrow(win_clean) < window * 0.8) next  # skip if too much missing data
+    zmat     <- scale(win_clean)
+    result[[length(result) + 1]] <- list(
+      start_date = dates[start],
+      end_date   = dates[end],
+      data       = zmat
+    )
+  }
+  return(result)
+}
+
+z_list <- rolling_zscore(rets_all, window = 60, step = 5)
+```
+
+
+## PCA and AR(computed absorption ration)
+```{r pressure, echo=TRUE}
+# We are only going to take pca for 5 stocks
+k <- 5
+pca_list <- map(z_list, function(z) {
+  pca <- prcomp(z$data, center = FALSE, scale. = FALSE)
+  tibble(
+    Date = z$end_date,
+    AR   = sum((pca$sdev[1:k]^2) / sum(pca$sdev^2))
+  )
+})
+
+absorp_ratio <- bind_rows(pca_list)
+
+absorp_ratio
+```
